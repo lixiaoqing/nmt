@@ -1,0 +1,7 @@
+#!/bin/bash
+
+export THEANO_FLAGS=device=gpu,floatX=float32
+python ./train_nmt_all.py
+
+
+
