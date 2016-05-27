@@ -6,7 +6,7 @@ import theano.tensor as tensor
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
 import cPickle as pkl
-import ipdb
+#import ipdb
 import numpy
 import copy
 
@@ -428,6 +428,7 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         # compute alignment weights
         alpha = tensor.dot(pctx__, U_att)+c_tt
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
+        alpha = alpha - tensor.max(alpha,axis=0)
         alpha = tensor.exp(alpha)
         if context_mask:
             alpha = alpha * context_mask
@@ -614,9 +615,7 @@ def build_model(tparams, options):
     logit_ctx = get_layer('ff')[1](tparams, ctxs, options,
                                    prefix='ff_logit_ctx', activ='linear')
     logit = tensor.tanh(logit_lstm+logit_prev+logit_ctx)
-    if options['use_dropout']:
-        logit = dropout_layer(logit, use_noise, trng)
-    logit = get_layer('ff')[1](tparams, logit, options, 
+    logit = get_layer('ff')[1](tparams, logit, options,
                                prefix='ff_logit', activ='linear')
     logit_shp = logit.shape
     probs = tensor.nnet.softmax(logit.reshape([logit_shp[0]*logit_shp[1],
@@ -666,7 +665,7 @@ def build_sampler(tparams, options, trng):
     print 'Done'
 
     # x: 1 x 1
-    y = tensor.vector('y_sampler', dtype='int64')
+    y = tensor.vector('y_sampler', dtype='int64')               # y is ith words of n sentences to be sampled
     init_state = tensor.matrix('init_state', dtype='float32')
 
     # if it's the first word, emb should be all zero and it is indicated by -1
@@ -685,6 +684,9 @@ def build_sampler(tparams, options, trng):
 
     # get the weighted averages of context for this target word y
     ctxs = proj[1]
+
+    # get the attention for predicting next word
+    next_att = proj[2]
 
     logit_lstm = get_layer('ff')[1](tparams, next_state, options,
                                     prefix='ff_logit_lstm', activ='linear')
@@ -706,7 +708,7 @@ def build_sampler(tparams, options, trng):
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
     inps = [y, ctx, init_state]
-    outs = [next_probs, next_sample, next_state]
+    outs = [next_probs, next_sample, next_state, next_att]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -723,17 +725,19 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
         assert not stochastic, \
             'Beam search does not support stochastic sampling'
 
-    sample = []
-    sample_score = []
+    sample = []         # store final samples
+    sample_score = []   # store score for each final sample
+    sample_att = []     # store attention for each final sample
     if stochastic:
         sample_score = 0
 
-    live_k = 1
-    dead_k = 0
+    live_k = 1          # number of cands to be expanded
+    dead_k = 0          # number of cands which already reach the sentence end
 
-    hyp_samples = [[]] * live_k
+    hyp_samples = [[]] * live_k             # list to store cands at each time step, each cand is a word list
     hyp_scores = numpy.zeros(live_k).astype('float32')
     hyp_states = []
+    hyp_att = [[]]
 
     # get initial state of decoder rnn and encoder context
     ret = f_init(x)
@@ -741,10 +745,10 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
     next_w = -1 * numpy.ones((1,)).astype('int64')  # bos indicator
 
     for ii in xrange(maxlen):
-        ctx = numpy.tile(ctx0, [live_k, 1])
+        ctx = numpy.tile(ctx0, [live_k, 1])         # generate live_k copies of ctx0
         inps = [next_w, ctx, next_state]
         ret = f_next(*inps)
-        next_p, next_w, next_state = ret[0], ret[1], ret[2]
+        next_p, next_w, next_state, next_att = ret[0], ret[1], ret[2], ret[3]
 
         if stochastic:
             if argmax:
@@ -756,40 +760,45 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
             if nw == 0:
                 break
         else:
-            cand_scores = hyp_scores[:, None] - numpy.log(next_p)
+            cand_scores = hyp_scores[:, None] - numpy.log(next_p)   # k cands to k^2 cands
             cand_flat = cand_scores.flatten()
-            ranks_flat = cand_flat.argsort()[:(k-dead_k)]
+            ranks_flat = cand_flat.argsort()[:(k-dead_k)]           # reserve k-dead_k cands
 
             voc_size = next_p.shape[1]
-            trans_indices = ranks_flat / voc_size
-            word_indices = ranks_flat % voc_size
+            trans_indices = ranks_flat / voc_size                   # which word generate current word
+            word_indices = ranks_flat % voc_size                    # word index of current word
             costs = cand_flat[ranks_flat]
 
             new_hyp_samples = []
             new_hyp_scores = numpy.zeros(k-dead_k).astype('float32')
             new_hyp_states = []
+            new_hyp_att = []
 
             for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
-                new_hyp_samples.append(hyp_samples[ti]+[wi])
+                new_hyp_samples.append(hyp_samples[ti]+[wi])        # current cand = previous cand + current word
                 new_hyp_scores[idx] = copy.copy(costs[idx])
                 new_hyp_states.append(copy.copy(next_state[ti]))
+                new_hyp_att.append(hyp_att[ti]+[copy.copy(next_att[ti])])
 
             # check the finished samples
             new_live_k = 0
             hyp_samples = []
             hyp_scores = []
             hyp_states = []
+            hyp_att = []
 
             for idx in xrange(len(new_hyp_samples)):
-                if new_hyp_samples[idx][-1] == 0:
+                if new_hyp_samples[idx][-1] == 0:                   # cand end with <eos>
                     sample.append(new_hyp_samples[idx])
                     sample_score.append(new_hyp_scores[idx])
+                    sample_att.append(new_hyp_att[idx])
                     dead_k += 1
                 else:
                     new_live_k += 1
-                    hyp_samples.append(new_hyp_samples[idx])
+                    hyp_samples.append(new_hyp_samples[idx])        # keep un-finished cands
                     hyp_scores.append(new_hyp_scores[idx])
                     hyp_states.append(new_hyp_states[idx])
+                    hyp_att.append(new_hyp_att[idx])
             hyp_scores = numpy.array(hyp_scores)
             live_k = new_live_k
 
@@ -807,8 +816,9 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
             for idx in xrange(live_k):
                 sample.append(hyp_samples[idx])
                 sample_score.append(hyp_scores[idx])
+                sample_att.append(hyp_att[idx])
 
-    return sample, sample_score
+    return sample, sample_score, sample_att
 
 
 # calculate the log probablities on a given corpus using translation model
@@ -828,8 +838,8 @@ def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
         for pp in pprobs:
             probs.append(pp)
 
-        if numpy.isnan(numpy.mean(probs)):
-            ipdb.set_trace()
+        #if numpy.isnan(numpy.mean(probs)):
+            #ipdb.set_trace()
 
         if verbose:
             print >>sys.stderr, '%d samples computed' % (n_done)
@@ -1161,7 +1171,7 @@ def train(dim_word=100,  # word vector dimensionality
                 # FIXME: random selection?
                 for jj in xrange(numpy.minimum(5, x.shape[1])):
                     stochastic = True
-                    sample, score = gen_sample(tparams, f_init, f_next,
+                    sample, score, attention = gen_sample(tparams, f_init, f_next,
                                                x[:, jj][:, None],
                                                model_options, trng=trng, k=1,
                                                maxlen=30,
@@ -1219,8 +1229,8 @@ def train(dim_word=100,  # word vector dimensionality
                         estop = True
                         break
 
-                if numpy.isnan(valid_err):
-                    ipdb.set_trace()
+                #if numpy.isnan(valid_err):
+                    #ipdb.set_trace()
 
                 print 'Valid ', valid_err
 

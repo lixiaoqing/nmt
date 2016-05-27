@@ -11,7 +11,7 @@ from nmt import (build_sampler, gen_sample, load_params,
 
 def _translate(seq, tparams, f_init, f_next, options, trng, k, normalize):
     # sample given an input sequence and obtain scores
-    sample, score = gen_sample(tparams, f_init, f_next,
+    sample, score, attention = gen_sample(tparams, f_init, f_next,
                                numpy.array(seq).reshape([len(seq), 1]),
                                options, trng=trng, k=k, maxlen=200,
                                stochastic=False, argmax=False)
@@ -21,7 +21,7 @@ def _translate(seq, tparams, f_init, f_next, options, trng, k, normalize):
         lengths = numpy.array([len(s) for s in sample])
         score = score / lengths
     sidx = numpy.argmin(score)
-    return sample[sidx]
+    return sample[sidx],attention[sidx]
 
 
 def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
@@ -50,16 +50,13 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
     word_idict_trg[1] = 'UNK'
 
     # utility function
-    def _seqs2words(caps):
-        capsw = []
-        for cc in caps:
-            ww = []
-            for w in cc:
-                if w == 0:
-                    break
-                ww.append(word_idict_trg[w])
-            capsw.append(' '.join(ww))
-        return capsw
+    def _seq2words(cc):
+        ww = []
+        for w in cc:
+            if w == 0:
+                break
+            ww.append(word_idict_trg[w])
+        return ' '.join(ww)
 
     #init model
     from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
@@ -74,7 +71,10 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
     f_init, f_next = build_sampler(tparams, options, trng)
 
     trans = []
+    att = []
     print 'Translating ', source_file, '...'
+    fo = open(saveto,'w')
+    fa = open(saveto+'.att','w')
     with open(source_file, 'r') as f:
         n = 0
         for line in f:
@@ -88,11 +88,16 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
             x = map(lambda w: word_dict[w] if w in word_dict else 1, words)
             x = map(lambda ii: ii if ii < options['n_words'] else 1, x)
             x += [0]
-            y = _translate(x, tparams, f_init, f_next, options, trng, k, normalize)
+            y,a = _translate(x, tparams, f_init, f_next, options, trng, k, normalize)
             trans.append(y)
+            att.append(a)
+            print >>fo,_seq2words(y)
+            print _seq2words(y)
+            for i,e in enumerate(a):
+                for j,p in enumerate(e):
+                    print >>fa,'{}-{}-{}'.format(i,j,p),
+            print >>fa
 
-    with open(saveto, 'w') as f:
-        print >>f, '\n'.join(_seqs2words(trans))
     print 'Done'
 
 if __name__ == "__main__":
