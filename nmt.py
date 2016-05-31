@@ -488,6 +488,69 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
             strict=True)
     return rval
 
+def gru_cond_layer_step(tparams, prev_y_emb, options, prefix='gru',
+                   context=None, prev_state=None, **kwargs):
+
+    assert context, 'Context must be provided'
+    assert context.ndim == 3, \
+        'Context must be 3-d: #annotation x #sample x dim'
+    assert prev_state, 'previous state must be provided'
+
+    dim = tparams[_p(prefix, 'Wcx')].shape[1]
+
+    def _slice(_x, n, dim):
+        if _x.ndim == 3:
+            return _x[:, :, n*dim:(n+1)*dim]
+        return _x[:, n*dim:(n+1)*dim]
+
+    # attention
+    # project previous hidden state
+    pstate_ = tensor.dot(prev_state, tparams[_p(prefix, 'Wd_att')])
+
+    # add projected context
+    pctx_ = tensor.dot(context, tparams[_p(prefix, 'Wc_att')]) + \
+    tparams[_p(prefix, 'b_att')]
+    pctx__ = pctx_ + pstate_[None, :, :]
+
+    # add projected previous output
+    pctx__ += tensor.dot(prev_y_emb, tparams[_p(prefix, 'Wi_att')])
+
+    pctx__ = tensor.tanh(pctx__)
+
+    # compute alignment weights
+    alpha = tensor.dot(pctx__, tparams[_p(prefix, 'U_att')])+tparams[_p(prefix, 'c_tt')]
+    alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
+    alpha = alpha - tensor.max(alpha,axis=0)
+    alpha = tensor.exp(alpha)
+    alpha = alpha / alpha.sum(0, keepdims=True)
+
+    # conpute the weighted averages - current context to gru
+    ctx_ = (context * alpha[:, :, None]).sum(0)
+
+    # conditional gru layer computations
+    preact = tensor.dot(prev_state, tparams[_p(prefix, 'U')])
+    state_below_ = tensor.dot(prev_y_emb, tparams[_p(prefix, 'W')]) + \
+        tparams[_p(prefix, 'b')]
+    preact += state_below_
+    preact += tensor.dot(ctx_, tparams[_p(prefix, 'Wc')])
+    preact = tensor.nnet.sigmoid(preact)
+
+    # reset and update gates
+    r = _slice(preact, 0, dim)
+    u = _slice(preact, 1, dim)
+
+    preactx = tensor.dot(prev_state, tparams[_p(prefix, 'Ux')])
+    preactx *= r
+    state_belowx = tensor.dot(prev_y_emb, tparams[_p(prefix, 'Wx')]) + \
+        tparams[_p(prefix, 'bx')]
+    preactx += state_belowx
+    preactx += tensor.dot(ctx_, tparams[_p(prefix, 'Wcx')])
+
+    # hidden state proposal, leaky integrate and obtain next hidden state
+    h = tensor.tanh(preactx)
+    h = u * prev_state + (1. - u) * h
+
+    return h, ctx_, alpha.T
 
 # initialize all parameters
 def init_params(options):
@@ -666,7 +729,7 @@ def build_sampler(tparams, options, trng):
 
     # x: 1 x 1
     y = tensor.vector('y_sampler', dtype='int64')               # y is ith words of n sentences to be sampled
-    init_state = tensor.matrix('init_state', dtype='float32')
+    prev_state = tensor.matrix('prev_state', dtype='float32')
 
     # if it's the first word, emb should be all zero and it is indicated by -1
     emb = tensor.switch(y[:, None] < 0,
@@ -674,11 +737,10 @@ def build_sampler(tparams, options, trng):
                         tparams['Wemb_dec'][y])
 
     # apply one step of conditional gru with attention
-    proj = get_layer(options['decoder'])[1](tparams, emb, options,
+    proj = gru_cond_layer_step(tparams, emb, options,
                                             prefix='decoder',
-                                            mask=None, context=ctx,
-                                            one_step=True,
-                                            init_state=init_state)
+                                            context=ctx,
+                                            prev_state=prev_state)
     # get the next hidden state
     next_state = proj[0]
 
@@ -707,7 +769,7 @@ def build_sampler(tparams, options, trng):
     # compile a function to do the whole thing above, next word probability,
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
-    inps = [y, ctx, init_state]
+    inps = [y, ctx, prev_state]
     outs = [next_probs, next_sample, next_state, next_att]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
